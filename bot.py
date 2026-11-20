@@ -563,12 +563,121 @@ def make_video(topic, fmt, dry=False):
     return work / "final.mp4", data
 
 
+def auto_once(fmt, privacy=None):
+    """Mavzu topadi, video yasaydi, YouTube'ga yuklaydi, Telegramga xabar beradi."""
+    hist = load_history()
+    used = [h["topic"] for h in hist] + recent_titles()
+    topic = None
+    if config.get("USE_TOPICS_FILE") == "1" and config.TOPICS_FILE.exists():
+        for line in config.TOPICS_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and line not in used:
+                topic = line
+                break
+    try:
+        if not topic:
+            topic = new_topic(used)
+        print("Mavzu:", topic)
+        path, data = make_video(topic, fmt)
+        url = upload(path, data, privacy)
+    except Exception as e:
+        send(f"❌ Video yuklanmadi\nMavzu: {topic}\nXato: {type(e).__name__}: {str(e)[:700]}")
+        raise
+    send(f"✅ Video yuklandi ({privacy or config.PRIVACY})\n{data['title']}\n{url}")
+    send_video(path, data["title"])
+    hist.append({"topic": topic, "title": data["title"], "url": url,
+                 "date": datetime.datetime.now().isoformat(timespec="seconds")})
+    save_history(hist)
+
+
+def posted_today():
+    """Kanalga bugun (Toshkent vaqti) video yuklanganmi? Xato bo'lsa False."""
+    try:
+        yt = _service()
+        ch = yt.channels().list(part="contentDetails", mine=True).execute()
+        pl = ch["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        items = yt.playlistItems().list(part="snippet", playlistId=pl, maxResults=5).execute()["items"]
+        today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5))).date()
+        for i in items:
+            t = datetime.datetime.strptime(i["snippet"]["publishedAt"][:19], "%Y-%m-%dT%H:%M:%S")
+            if (t + datetime.timedelta(hours=5)).date() == today:
+                return True
+    except Exception as e:
+        print("posted_today xato:", e)
+    return False
+
+
+def serve(fmt, privacy=None):
+    """Render Web Service uchun: port ochib turadi va har kuni RUN_HOUR (Toshkent) da video yasaydi.
+    /run?key=RUN_KEY havolasi bilan qo'lda ishga tushirish mumkin."""
+    import http.server
+    import threading
+
+    hour = int(config.get("RUN_HOUR", "9"))
+    key = config.get("RUN_KEY")
+    port = int(os.environ.get("PORT", "10000"))
+    lock = threading.Lock()
+    state = {"last": None}
+
+    def job():
+        if not lock.acquire(blocking=False):
+            print("Oldingi video hali yasalmoqda, o'tkazib yuborildi")
+            return
+        try:
+            auto_once(fmt, privacy)
+        except Exception as e:
+            print("Xato:", type(e).__name__, e)
+        finally:
+            lock.release()
+
+    def tk_now():
+        return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5)))
+
+    def scheduler():
+        while True:
+            try:
+                t = tk_now()
+                if t.hour >= hour and state["last"] != t.date():
+                    state["last"] = t.date()
+                    if not posted_today():
+                        job()
+            except Exception as e:
+                print("Rejalashtiruvchi xato:", e)
+            time.sleep(60)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, text):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(text.encode("utf-8"))
+
+        def do_GET(self):
+            if self.path.startswith("/run"):
+                if key and f"key={key}" in self.path:
+                    threading.Thread(target=job, daemon=True).start()
+                    return self._send(200, "Boshlandi. Natija Telegramga keladi.")
+                return self._send(403, "Ruxsat yo'q")
+            self._send(200, "Video bot ishlayapti")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    threading.Thread(target=scheduler, daemon=True).start()
+    print(f"Server {port} portda. Kunlik ishga tushish: {hour}:00 (Toshkent)")
+    http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     pa = sub.add_parser("auth")
     pa.add_argument("--manual", action="store_true", help="havolani qo'lda nusxalash usuli")
-    for name in ("make", "auto"):
+    for name in ("make", "auto", "serve"):
         p = sub.add_parser(name)
         p.add_argument("--format", choices=["shorts", "long"], default=config.VIDEO_FORMAT)
         p.add_argument("--privacy", choices=["private", "unlisted", "public"])
@@ -579,43 +688,19 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == "auth":
-        import uploader
         auth_manual() if a.manual else auth()
-        return
-
-    if a.cmd == "make":
+    elif a.cmd == "make":
         path, data = make_video(a.topic, a.format, a.dry_run)
         if a.upload:
-            import uploader
             upload(path, data, a.privacy)
-        return
-
-    if a.cmd == "auto":
-        import uploader
-        hist = load_history()
-        used = [h["topic"] for h in hist] + recent_titles()
-        topic = None
-        if config.get("USE_TOPICS_FILE") == "1" and config.TOPICS_FILE.exists():
-            for line in config.TOPICS_FILE.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and line not in used:
-                    topic = line
-                    break
-        if not topic:
-            topic = new_topic(used)
-        print("Mavzu:", topic)
-        try:
-            path, data = make_video(topic, a.format)
-            url = upload(path, data, a.privacy)
-        except Exception as e:
-            send(f"❌ Video yuklanmadi\nMavzu: {topic}\nXato: {type(e).__name__}: {str(e)[:700]}")
-            raise
-        send(f"✅ Video yuklandi ({a.privacy or config.PRIVACY})\n{data['title']}\n{url}")
-        send_video(path, data["title"])
-        hist.append({"topic": topic, "title": data["title"], "url": url,
-                     "date": datetime.datetime.now().isoformat(timespec="seconds")})
-        save_history(hist)
-
+    elif a.cmd == "serve":
+        serve(a.format, a.privacy)
+    elif a.cmd == "auto":
+        # Render Web Service PORT beradi: shunda bir martalik emas, doimiy server rejimi
+        if os.environ.get("PORT") and config.get("FORCE_ONESHOT") != "1":
+            serve(a.format, a.privacy)
+        else:
+            auto_once(a.format, a.privacy)
 
 
 if __name__ == "__main__":

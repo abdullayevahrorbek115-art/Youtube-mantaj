@@ -152,7 +152,7 @@ def _ask_gemini(prompt, max_tokens):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             cfg = {"maxOutputTokens": max(max_tokens, 2048), "temperature": 0.8}
             cfg["thinkingConfig"] = {"thinkingLevel": "low"} if "gemini-3" in model else {"thinkingBudget": 0}
-            for attempt in range(3):
+            for attempt in range(6):
                 try:
                     r = requests.post(url, headers=hdr, timeout=180,
                                       json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg})
@@ -162,16 +162,28 @@ def _ask_gemini(prompt, max_tokens):
                     time.sleep(5)
                     continue
                 if r.status_code == 200:
-                    parts = r.json()["candidates"][0]["content"]["parts"]
-                    return "".join(p.get("text", "") for p in parts)
-                last = f"{model}: {r.status_code} {r.text[:200]}"
-                print("Gemini:", last[:120])
-                if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in cfg:
-                    cfg.pop("thinkingConfig")
+                    parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    txt = "".join(p.get("text", "") for p in parts).strip()
+                    if txt:
+                        return txt
+                    last = f"{model}: bo'sh javob"
+                    print("Gemini:", last, str(r.json())[:200])
+                    cfg.pop("thinkingConfig", None)  # 'o'ylash' tokenlari javobni yeb qo'ygan bo'lishi mumkin
                     cfg["maxOutputTokens"] = 8192
                     continue
+                last = f"{model}: {r.status_code} {r.text[:200]}"
+                print("Gemini:", last[:160])
+                if r.status_code == 400:  # noto'g'ri argument: ixtiyoriy sozlamalarni birma-bir olib tashlaymiz
+                    if "thinkingConfig" in cfg:
+                        cfg.pop("thinkingConfig")
+                        cfg["maxOutputTokens"] = 8192
+                        continue
+                    if "temperature" in cfg:
+                        cfg.pop("temperature")
+                        continue
+                    break
                 if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(8 * (attempt + 1))
+                    time.sleep(8 * min(attempt + 1, 3))
                     continue
                 break  # 404 va boshqalar: keyingi modelga
         if rnd == 0:

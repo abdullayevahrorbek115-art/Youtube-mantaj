@@ -74,15 +74,21 @@ def _creds():
 
 
 def send(text):
+    """Telegramga xabar yuboradi. Natija matnini qaytaradi (sinov uchun)."""
     token, chat = _creds()
     if not token or not chat:
         print("[telegram o'chiq]", text)
-        return
+        return "XATO: TELEGRAM_BOT_TOKEN yoki TELEGRAM_CHAT_ID Render'da kiritilmagan"
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat, "text": text[:4000]}, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat, "text": text[:4000]}, timeout=30)
+        info = f"Telegram javobi: {r.status_code} {r.text[:300]}"
+        if r.status_code != 200:
+            print(info)
+        return info
     except Exception as e:
         print("Telegramga yuborib bo'lmadi:", e)
+        return f"XATO: {type(e).__name__}: {e}"
 
 
 def send_video(path, caption):
@@ -104,37 +110,70 @@ def send_video(path, caption):
 API = "https://api.anthropic.com/v1/messages"
 
 
+_GEMINI_CACHE = {}
+
+
+def _gemini_models():
+    """Tanlangan modeldan boshlab, hisobda mavjud 'flash' modellar ro'yxati (nomlar o'zgarib turadi)."""
+    if "m" in _GEMINI_CACHE:
+        return _GEMINI_CACHE["m"]
+    found = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": config.GEMINI_API_KEY},
+                         params={"pageSize": 200}, timeout=30)
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                name = m["name"].split("/")[-1]
+                if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in name
+                        and not any(x in name for x in ("image", "tts", "live", "audio", "embed", "native", "robotics"))):
+                    found.append(name)
+    except Exception as e:
+        print("Modellar ro'yxatini olib bo'lmadi:", e)
+    found.sort(reverse=True)  # yangi versiyalar oldinda
+    order = [config.GEMINI_MODEL, "gemini-flash-latest"] + found
+    models = list(dict.fromkeys(order))[:6]
+    _GEMINI_CACHE["m"] = models
+    print("Gemini modellari navbati:", models)
+    return models
+
+
 def _ask_gemini(prompt, max_tokens):
     hdr = {"x-goog-api-key": config.GEMINI_API_KEY, "content-type": "application/json"}
-    models = [config.GEMINI_MODEL] + [m for m in ("gemini-3.8-flash", "gemini-flash-latest")
-                                      if m != config.GEMINI_MODEL]
+    models = []
+    for m in (config.GEMINI_MODEL, "gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"):
+        if m and m not in models:
+            models.append(m)
     last = "javob yo'q"
-    for model in models:  # model o'chirilgan (404) yoki doim band bo'lsa, keyingisiga o'tadi
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        cfg = {"maxOutputTokens": max(max_tokens, 2048), "temperature": 0.8}
-        # 'o'ylash'ni minimal qilamiz: tez va tejamkor
-        cfg["thinkingConfig"] = {"thinkingLevel": "low"} if "gemini-3" in model else {"thinkingBudget": 0}
-        for attempt in range(3):
-            try:
-                r = requests.post(url, headers=hdr, timeout=180,
-                                  json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg})
-            except (requests.Timeout, requests.ConnectionError) as e:
-                last = f"{model}: {type(e).__name__}"
-                print("Gemini kutish/ulanish xatosi, qayta uriniladi:", last)
-                time.sleep(4)
-                continue
-            if r.status_code == 200:
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts)
-            last = f"{model}: {r.status_code} {r.text[:300]}"
-            if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in cfg:
-                cfg.pop("thinkingConfig")  # bu model sozlamani qabul qilmasa
-                cfg["maxOutputTokens"] = 8192
-                continue
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(6 * (attempt + 1))
-                continue
-            break  # 404 va boshqalar: keyingi modelga
+    for rnd in range(2):  # hamma model band bo'lsa, 45 soniya kutib yana bir aylanish
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            cfg = {"maxOutputTokens": max(max_tokens, 2048), "temperature": 0.8}
+            cfg["thinkingConfig"] = {"thinkingLevel": "low"} if "gemini-3" in model else {"thinkingBudget": 0}
+            for attempt in range(3):
+                try:
+                    r = requests.post(url, headers=hdr, timeout=180,
+                                      json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg})
+                except (requests.Timeout, requests.ConnectionError) as e:
+                    last = f"{model}: {type(e).__name__}"
+                    print("Gemini kutish/ulanish xatosi:", last)
+                    time.sleep(5)
+                    continue
+                if r.status_code == 200:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    return "".join(p.get("text", "") for p in parts)
+                last = f"{model}: {r.status_code} {r.text[:200]}"
+                print("Gemini:", last[:120])
+                if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in cfg:
+                    cfg.pop("thinkingConfig")
+                    cfg["maxOutputTokens"] = 8192
+                    continue
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(8 * (attempt + 1))
+                    continue
+                break  # 404 va boshqalar: keyingi modelga
+        if rnd == 0:
+            time.sleep(45)
     raise RuntimeError(f"Gemini xato: {last}")
 
 
@@ -590,43 +629,124 @@ def auto_once(fmt, privacy=None):
     save_history(hist)
 
 
-def posted_today():
-    """Kanalga bugun (Toshkent vaqti) video yuklanganmi? Xato bo'lsa False."""
+def posted_count_today():
+    """Kanalga bugun (Toshkent vaqti) nechta video yuklangan. Xato bo'lsa 0."""
     try:
         yt = _service()
         ch = yt.channels().list(part="contentDetails", mine=True).execute()
         pl = ch["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
-        items = yt.playlistItems().list(part="snippet", playlistId=pl, maxResults=5).execute()["items"]
+        items = yt.playlistItems().list(part="snippet", playlistId=pl, maxResults=10).execute()["items"]
         today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5))).date()
+        n = 0
         for i in items:
             t = datetime.datetime.strptime(i["snippet"]["publishedAt"][:19], "%Y-%m-%dT%H:%M:%S")
             if (t + datetime.timedelta(hours=5)).date() == today:
-                return True
+                n += 1
+        return n
     except Exception as e:
-        print("posted_today xato:", e)
-    return False
+        print("posted_count_today xato:", e)
+        return 0
+
+
+def parse_times(text):
+    """'7:00 18:00', '07,18', '9, 21:30' -> [(7,0),(18,0)]. Noto'g'ri bo'lsa None."""
+    parts = [p for p in re.split(r"[\s,;]+", text.strip()) if p]
+    out = []
+    for p in parts:
+        m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", p)
+        if not m:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if h > 23 or mi > 59:
+            return None
+        out.append((h, mi))
+    return sorted(set(out)) or None
+
+
+def fmt_times(times):
+    return ", ".join(f"{h:02d}:{m:02d}" for h, m in times)
+
+
+def schedule_step(state, t, now, times, job, count_posted, max_attempts=4, retry_min=25):
+    """Kuniga len(times) ta video: har bir vaqt kelganda yasaydi. Xato bo'lsa retry_min daqiqadan keyin qayta uriniladi."""
+    if state.get("date") != t.date():
+        state.update(date=t.date(), made=0, synced=False, attempts=0, next=0)
+    mins = t.hour * 60 + t.minute
+    due = sum(1 for h, m in times if h * 60 + m <= mins)
+    if due == 0 or state["made"] >= due:
+        return
+    if state["attempts"] >= max_attempts * max(len(times), 1) or now < state["next"]:
+        return
+    if not state["synced"]:  # qayta ishga tushganda kanaldagi bugungi videolarni hisobga olamiz
+        state["made"] = max(state["made"], count_posted())
+        state["synced"] = True
+        if state["made"] >= due:
+            return
+    state["attempts"] += 1
+    res = job()
+    if res is True:
+        state["made"] += 1
+    elif res is None:  # boshqa video yasalmoqda
+        state["attempts"] -= 1
+        state["next"] = now + 600
+    else:
+        state["next"] = now + retry_min * 60
+
+
+def handle_command(text, holder, trigger, privacy):
+    """Telegramdagi xabarga javob matnini qaytaradi (yoki None)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    first = text.split()[0].lower().split("@")[0] if text.startswith("/") else ""
+    rest = text.split(None, 1)[1] if text.startswith("/") and len(text.split(None, 1)) > 1 else text
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5)))
+    status = (f"🕒 Hozir: {now:%H:%M} (Toshkent)\n📅 Kunlik video vaqtlari: {fmt_times(holder['times'])}\n"
+              f"🔒 Holat: {privacy or config.PRIVACY}\n\n"
+              "Buyruqlar:\n/vaqt 07:00 18:00 - vaqtlarni o'zgartirish\n/video - hozir bitta video yasash\n/holat - shu xabar")
+    if first in ("/start", "/holat", "/status", "/help", ""):
+        if first == "" and parse_times(text):
+            pass  # oddiy vaqt yozilgan: pastda qayta ishlanadi
+        else:
+            return status
+    if first in ("/video", "/hozir"):
+        trigger()
+        return "🎬 Video yasash boshlandi. Tayyor bo'lgach xabar yuboraman (5-10 daqiqa)."
+    if first in ("/vaqt", "/time", "/jadval", ""):
+        if first and rest == text:  # /vaqt argumentsiz
+            return f"📅 Hozirgi vaqtlar: {fmt_times(holder['times'])}\nO'zgartirish: /vaqt 07:00 18:00"
+        times = parse_times(rest)
+        if not times:
+            return "Vaqt formati noto'g'ri. Masalan: /vaqt 07:00 18:00"
+        holder["times"] = times
+        return (f"✅ Saqlandi: har kuni {fmt_times(times)} (Toshkent) da {len(times)} ta video.\n"
+                f"Doimiy qilish uchun Render'da RUN_TIMES={','.join(f'{h:02d}:{m:02d}' for h, m in times)} qo'yib qo'ying.")
+    return status
 
 
 def serve(fmt, privacy=None):
-    """Render Web Service uchun: port ochib turadi va har kuni RUN_HOUR (Toshkent) da video yasaydi.
-    /run?key=RUN_KEY havolasi bilan qo'lda ishga tushirish mumkin."""
+    """Render Web Service uchun: port ochib turadi, belgilangan vaqtlarda video yasaydi, Telegram buyruqlarini o'qiydi.
+    /run?key=RUN_KEY - qo'lda ishga tushirish, /test?key=RUN_KEY - Telegram sinovi."""
     import http.server
     import threading
 
-    hour = int(config.get("RUN_HOUR", "9"))
     key = config.get("RUN_KEY")
     port = int(os.environ.get("PORT", "10000"))
     lock = threading.Lock()
-    state = {"last": None}
+    raw = config.get("RUN_TIMES") or f"{config.get('RUN_HOUR', '9')}:00"
+    holder = {"times": parse_times(raw) or [(9, 0)]}
 
     def job():
+        """True: muvaffaqiyatli, False: xato, None: boshqa video hali yasalmoqda."""
         if not lock.acquire(blocking=False):
             print("Oldingi video hali yasalmoqda, o'tkazib yuborildi")
-            return
+            return None
         try:
             auto_once(fmt, privacy)
+            return True
         except Exception as e:
             print("Xato:", type(e).__name__, e)
+            return False
         finally:
             lock.release()
 
@@ -634,16 +754,47 @@ def serve(fmt, privacy=None):
         return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5)))
 
     def scheduler():
+        state = {}
         while True:
             try:
-                t = tk_now()
-                if t.hour >= hour and state["last"] != t.date():
-                    state["last"] = t.date()
-                    if not posted_today():
-                        job()
+                schedule_step(state, tk_now(), time.time(), holder["times"], job, posted_count_today)
             except Exception as e:
                 print("Rejalashtiruvchi xato:", e)
             time.sleep(60)
+
+    def trigger():
+        threading.Thread(target=job, daemon=True).start()
+
+    def telegram_loop():
+        token, chat = _creds()
+        if not token or not chat:
+            return
+        base = f"https://api.telegram.org/bot{token}"
+        offset = None
+        try:  # eski xabarlarni o'tkazib yuboramiz
+            r = requests.get(base + "/getUpdates", params={"offset": -1, "timeout": 0}, timeout=30).json()
+            if r.get("result"):
+                offset = r["result"][-1]["update_id"] + 1
+        except Exception as e:
+            print("getUpdates boshlang'ich xato:", e)
+        while True:
+            try:
+                r = requests.get(base + "/getUpdates", params={"offset": offset, "timeout": 30}, timeout=45).json()
+                if not r.get("ok"):
+                    print("getUpdates:", str(r)[:200])
+                    time.sleep(30)
+                    continue
+                for u in r.get("result", []):
+                    offset = u["update_id"] + 1
+                    m = u.get("message") or u.get("channel_post")
+                    if not m or str(m["chat"]["id"]) != str(chat):
+                        continue
+                    reply = handle_command(m.get("text"), holder, trigger, privacy)
+                    if reply:
+                        send(reply)
+            except Exception as e:
+                print("Telegram tinglash xatosi:", e)
+                time.sleep(10)
 
     class H(http.server.BaseHTTPRequestHandler):
         def _send(self, code, text):
@@ -653,9 +804,13 @@ def serve(fmt, privacy=None):
             self.wfile.write(text.encode("utf-8"))
 
         def do_GET(self):
+            if self.path.startswith("/test"):
+                if key and f"key={key}" in self.path:
+                    return self._send(200, send("✅ Sinov xabari: Telegram ulangan, bot ishlayapti"))
+                return self._send(403, "Ruxsat yo'q")
             if self.path.startswith("/run"):
                 if key and f"key={key}" in self.path:
-                    threading.Thread(target=job, daemon=True).start()
+                    trigger()
                     return self._send(200, "Boshlandi. Natija Telegramga keladi.")
                 return self._send(403, "Ruxsat yo'q")
             self._send(200, "Video bot ishlayapti")
@@ -668,7 +823,8 @@ def serve(fmt, privacy=None):
             pass
 
     threading.Thread(target=scheduler, daemon=True).start()
-    print(f"Server {port} portda. Kunlik ishga tushish: {hour}:00 (Toshkent)")
+    threading.Thread(target=telegram_loop, daemon=True).start()
+    print(f"Server {port} portda. Kunlik vaqtlar: {fmt_times(holder['times'])} (Toshkent)")
     http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 
 

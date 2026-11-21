@@ -607,6 +607,11 @@ def make_video(topic, fmt, dry=False):
     work = config.OUTPUT_DIR / f"{datetime.datetime.now():%Y%m%d-%H%M%S}_{slug(topic)}"
     work.mkdir(parents=True, exist_ok=True)
     (work / "script.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if fmt == "shorts":  # YouTube Shorts sifatida tanishi uchun
+        if "#shorts" not in data["title"].lower() and len(data["title"]) <= 90:
+            data["title"] = data["title"].rstrip() + " #Shorts"
+        if "#shorts" not in data.get("description", "").lower():
+            data["description"] = (data.get("description", "").rstrip() + "\n\n#Shorts").strip()
     n = len(data["scenes"])
     print(f"Sarlavha: {data['title']}  ({n} sahna)")
     if not dry:

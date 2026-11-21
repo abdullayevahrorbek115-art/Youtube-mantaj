@@ -34,7 +34,8 @@ def _load_env():
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 def get(name, default=None):
-    return os.environ.get(name, default)
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
 
 
 _load_env()
@@ -65,7 +66,8 @@ class config:
     CLIENT_SECRETS = ROOT / "client_secret.json"
     TOKEN_FILE = ROOT / "token.json"
 
-    SIZES = {"shorts": (1080, 1920), "long": (1920, 1080)}
+    SIZES = ({"shorts": (1080, 1920), "long": (1920, 1080)} if get("HD") == "1"
+             else {"shorts": (720, 1280), "long": (1280, 720)})
 
 
 # ==================== py ====================
@@ -276,7 +278,19 @@ def tts(text, out_path, dry=False):
     async def go():
         await edge_tts.Communicate(text, config.TTS_VOICE, rate=config.TTS_RATE).save(str(out_path))
 
-    asyncio.run(go())
+    async def guarded():
+        await asyncio.wait_for(go(), timeout=90)
+
+    last = None
+    for _ in range(3):
+        try:
+            asyncio.run(guarded())
+            return out_path
+        except Exception as e:
+            last = e
+            print("Ovoz xatosi, qayta uriniladi:", type(e).__name__, e)
+            time.sleep(3)
+    raise RuntimeError(f"Ovoz (edge-tts) ishlamadi: {type(last).__name__}: {last}")
     return out_path
 
 
@@ -380,24 +394,32 @@ def fetch_visual(query, fmt, out_base, used_ids, dry=False):
 
 
 # ---------------------------------------------------------------- yig'ish
-def render_scene(media, kind, audio, out, fmt):
+def render_scene(media, kind, audio, out, fmt, text=None):
     w, h = config.SIZES[fmt]
+    out = pathlib.Path(out)
     dur = duration(audio) + 0.35
     if kind == "video":
         inp = ["-stream_loop", "-1", "-i", str(media)]
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=30,setsar=1,format=yuv420p"
+        vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=25,setsar=1"
     else:
-        frames = int(dur * 30) + 1
+        frames = int(dur * 25) + 1
+        zw, zh = int(w * 1.4) // 2 * 2, int(h * 1.4) // 2 * 2
         inp = ["-loop", "1", "-i", str(media)]
         vf = (
-            f"scale={w*2}:{h*2}:force_original_aspect_ratio=increase,crop={w*2}:{h*2},"
-            f"zoompan=z='min(zoom+0.0007,1.2)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=30,"
-            "setsar=1,format=yuv420p"
+            f"scale={zw}:{zh}:force_original_aspect_ratio=increase,crop={zw}:{zh},"
+            f"zoompan=z='min(zoom+0.0007,1.2)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=25,"
+            "setsar=1"
         )
+    if text:  # subtitrni shu sahnaning o'ziga yozamiz (oxirida qayta kodlash kerak bo'lmaydi)
+        ass = out.with_suffix(".ass")
+        write_ass([{"narration": text}], [dur], fmt, ass)
+        vf += f",ass={ass.name}"
+    vf += ",format=yuv420p"
     run(
         ["ffmpeg", "-y", *inp, "-i", str(audio), "-t", f"{dur:.3f}", "-vf", vf, "-af", "apad",
-         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "160k", str(out)]
+         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+         "-threads", "2", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k", out.name],
+        cwd=out.parent,
     )
     return dur
 
@@ -435,22 +457,22 @@ def write_ass(scenes, durs, fmt, path):
 
 
 def assemble(scene_files, workdir, final_path):
+    """Sahnalarni ulaydi. Video qayta kodlanmaydi (tez); faqat fon musiqa bo'lsa ovoz aralashtiriladi."""
     workdir = pathlib.Path(workdir)
+    final_name = pathlib.Path(final_path).name
     lst = workdir / "list.txt"
     lst.write_text("".join(f"file '{pathlib.Path(f).name}'\n" for f in scene_files), encoding="utf-8")
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "full.mp4"], cwd=workdir)
-
-    cmd = ["ffmpeg", "-y", "-i", "full.mp4"]
     music = config.MUSIC_FILE and pathlib.Path(config.MUSIC_FILE).exists()
-    if music:
-        cmd += ["-stream_loop", "-1", "-i", str(pathlib.Path(config.MUSIC_FILE).resolve())]
-        fc = "[0:v]ass=subs.ass[v];[1:a]volume=0.10[m];[0:a][m]amix=inputs=2:duration=first:normalize=0[a]"
-        cmd += ["-filter_complex", fc, "-map", "[v]", "-map", "[a]"]
-    else:
-        cmd += ["-vf", "ass=subs.ass", "-map", "0:v", "-map", "0:a"]
-    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "21", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", pathlib.Path(final_path).name]
-    run(cmd, cwd=workdir)
+    if not music:
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
+             "-movflags", "+faststart", final_name], cwd=workdir)
+        return
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "full.mp4"], cwd=workdir)
+    run(["ffmpeg", "-y", "-i", "full.mp4", "-stream_loop", "-1", "-i", str(pathlib.Path(config.MUSIC_FILE).resolve()),
+         "-filter_complex", "[1:a]volume=0.10[m];[0:a][m]amix=inputs=2:duration=first:normalize=0[a]",
+         "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+         "-movflags", "+faststart", final_name], cwd=workdir)
+
 
 # ==================== py ====================
 SCOPES = [
@@ -585,20 +607,23 @@ def make_video(topic, fmt, dry=False):
     work = config.OUTPUT_DIR / f"{datetime.datetime.now():%Y%m%d-%H%M%S}_{slug(topic)}"
     work.mkdir(parents=True, exist_ok=True)
     (work / "script.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Sarlavha: {data['title']}  ({len(data['scenes'])} sahna)")
+    n = len(data["scenes"])
+    print(f"Sarlavha: {data['title']}  ({n} sahna)")
+    if not dry:
+        send(f"📝 Ssenariy tayyor: {data['title']} ({n} sahna). Ovoz va tasvir tayyorlanmoqda...")
 
-    used, scene_files, durs = set(), [], []
+    t0 = time.time()
+    used, scene_files = set(), []
     for i, sc in enumerate(data["scenes"], 1):
-        print(f"  sahna {i}/{len(data['scenes'])}")
         audio = tts(sc["narration"], work / f"a{i:02d}.mp3", dry)
         vis, kind = fetch_visual(sc["query"], fmt, work / f"v{i:02d}", used, dry)
         out = work / f"s{i:02d}.mp4"
-        durs.append(render_scene(vis, kind, audio, out, fmt))
+        render_scene(vis, kind, audio, out, fmt, sc["narration"])
         scene_files.append(out)
+        print(f"  sahna {i}/{n} tayyor ({int(time.time() - t0)} s)", flush=True)
 
-    write_ass(data["scenes"], durs, fmt, work / "subs.ass")
     assemble(scene_files, work, work / "final.mp4")
-    print("Tayyor:", work / "final.mp4")
+    print("Tayyor:", work / "final.mp4", f"({int(time.time() - t0)} s)", flush=True)
     return work / "final.mp4", data
 
 
@@ -618,6 +643,7 @@ def auto_once(fmt, privacy=None):
             topic = new_topic(used)
         print("Mavzu:", topic)
         path, data = make_video(topic, fmt)
+        send("⬆️ Video tayyor, YouTube'ga yuklanmoqda...")
         url = upload(path, data, privacy)
     except Exception as e:
         send(f"❌ Video yuklanmadi\nMavzu: {topic}\nXato: {type(e).__name__}: {str(e)[:700]}")
@@ -710,8 +736,9 @@ def handle_command(text, holder, trigger, privacy):
         else:
             return status
     if first in ("/video", "/hozir"):
-        trigger()
-        return "🎬 Video yasash boshlandi. Tayyor bo'lgach xabar yuboraman (5-10 daqiqa)."
+        if trigger() is False:
+            return "⏳ Oldingi video hali yasalmoqda. Tugagach yana urinib ko'ring."
+        return "🎬 Video yasash boshlandi. Tayyor bo'lgach xabar yuboraman."
     if first in ("/vaqt", "/time", "/jadval", ""):
         if first and rest == text:  # /vaqt argumentsiz
             return f"📅 Hozirgi vaqtlar: {fmt_times(holder['times'])}\nO'zgartirish: /vaqt 07:00 18:00"
@@ -763,7 +790,10 @@ def serve(fmt, privacy=None):
             time.sleep(60)
 
     def trigger():
+        if lock.locked():
+            return False
         threading.Thread(target=job, daemon=True).start()
+        return True
 
     def telegram_loop():
         token, chat = _creds()
@@ -829,6 +859,11 @@ def serve(fmt, privacy=None):
 
 
 def main():
+    for st in (sys.stdout, sys.stderr):  # Render loglarida natija darrov ko'rinsin
+        try:
+            st.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     pa = sub.add_parser("auth")
